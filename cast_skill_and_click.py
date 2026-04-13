@@ -11,14 +11,23 @@ import keyboard
 import win32api
 import win32con
 
+from move_to_enemy import move_to_enemy
+
 # =========================
 # CONFIGURAÇÕES DO JOGO
 # =========================
 WINDOW_TITLE_CONTAINS = os.environ.get("CURRENT_ACCOUNT", "Sallazzar")
 VICTORY_TEMPLATE = os.path.join("templates", "combat", "victory.png")
 
-SKILL_KEYS = ["1", "2", "3"]
+SKILL_KEYS = ["1", "2", "3", "4"]
 DELAY_BETWEEN_SKILLS = 0.01   # era 0.04
+
+SKILL_TYPE = {
+    "1": "summon",
+    "2": "summon",
+    "3": "summon",
+    "4": "attack",
+}
 
 CLICK_COUNT = 2
 CLICK_INTERVAL = 0.02
@@ -47,6 +56,12 @@ class WindowRect:
     def w(self) -> int: return self.right - self.left
     @property
     def h(self) -> int: return self.bottom - self.top
+
+@dataclass
+class EnemyCandidate:
+    center: Tuple[int, int]
+    bbox: Tuple[int, int, int, int]
+    score: float
 
 @dataclass
 class TileCandidate:
@@ -79,6 +94,60 @@ def tile_dentro_da_area_segura(cx: int, cy: int, frame_w: int, frame_h: int) -> 
     y_min = int(frame_h * MARGEM_BORDA_Y)
     y_max = int(frame_h * (1.0 - MARGEM_BORDA_Y))
     return x_min < cx < x_max and y_min < cy < y_max
+
+def detect_enemies(frame_bgr: np.ndarray) -> List[EnemyCandidate]:
+    h_frame, w_frame = frame_bgr.shape[:2]
+
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # Máscara vermelha dupla (vermelho cruza 0° no HSV)
+    mask_red1 = cv2.inRange(hsv, np.array([0, 160, 100]), np.array([10, 255, 255]))
+    mask_red2 = cv2.inRange(hsv, np.array([170, 160, 100]), np.array([180, 255, 255]))
+    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+
+    # Dilata o vermelho ~18px para envolver o corpo preto adjacente
+    kernel = np.ones((18, 18), np.uint8)
+    mask_red_dilated = cv2.dilate(mask_red, kernel, iterations=1)
+
+    # Máscara preta intersectada com a zona dilatada
+    mask_black = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 80, 80]))
+    mask_black_near_red = cv2.bitwise_and(mask_black, mask_red_dilated)
+
+    contornos, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidatos = []
+    for cnt in contornos:
+        area = cv2.contourArea(cnt)
+        if not (40 < area < 8000):
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        cx, cy = x + w // 2, y + h // 2
+
+        if not tile_dentro_da_area_segura(cx, cy, w_frame, h_frame):
+            continue
+
+        # Verifica pixels pretos confirmados próximos ao vermelho
+        roi = mask_black_near_red[y:y+h, x:x+w]
+        black_pixels = int(np.sum(roi > 0))
+        if black_pixels < 30:
+            continue
+
+        candidatos.append(EnemyCandidate(center=(cx, cy), bbox=(x, y, w, h), score=area))
+
+    candidatos.sort(key=lambda e: e.score, reverse=True)
+    return candidatos
+
+def save_debug_enemies(frame: np.ndarray, candidates: List[EnemyCandidate], skill_num: int):
+    if not SAVE_DEBUG_IMAGES: return
+    os.makedirs("debug", exist_ok=True)
+    annotated = frame.copy()
+    for c in candidates:
+        x, y, w, h = c.bbox
+        cv2.rectangle(annotated, (x, y), (x+w, y+h), (0, 0, 255), 2)
+        cv2.circle(annotated, c.center, 5, (255, 0, 0), -1)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    cv2.imwrite(f"debug/IA_skill_{skill_num}_enemies_{ts}.png", annotated)
 
 def detect_tiles(frame_bgr: np.ndarray) -> List[TileCandidate]:
     h_frame, w_frame = frame_bgr.shape[:2]
@@ -130,25 +199,39 @@ def main():
     centro_x = rect.left + rect.w // 2
     centro_y = rect.top + rect.h // 2
 
+    move_to_enemy()
+
     for idx, key in enumerate(SKILL_KEYS, start=1):
         frame = grab_window_bgr(rect)
         if check_victory(frame, victory_tpl):
             fast_click(centro_x, centro_y)
             return
 
+        tipo = SKILL_TYPE.get(key, "summon")
         keyboard.press_and_release(key)
         time.sleep(0.03)
 
         frame = grab_window_bgr(rect)
-        tiles = detect_tiles(frame)
 
-        if tiles:
-            save_debug(frame, tiles, idx)
-            for tile in tiles:
+        if tipo == "attack":
+            inimigos = detect_enemies(frame)
+            save_debug_enemies(frame, inimigos, idx)
+            for inimigo in inimigos:
                 keyboard.press_and_release(key)
                 time.sleep(0.03)
-                fast_click(rect.left + tile.center[0], rect.top + tile.center[1])
+                fast_click(rect.left + inimigo.center[0], rect.top + inimigo.center[1])
                 time.sleep(0.02)
+            fast_click(centro_x, centro_y)
+
+        else:  # summon — comportamento original inalterado
+            tiles = detect_tiles(frame)
+            if tiles:
+                save_debug(frame, tiles, idx)
+                for tile in tiles:
+                    keyboard.press_and_release(key)
+                    time.sleep(0.03)
+                    fast_click(rect.left + tile.center[0], rect.top + tile.center[1])
+                    time.sleep(0.02)
             fast_click(centro_x, centro_y)
 
         time.sleep(DELAY_BETWEEN_SKILLS)
